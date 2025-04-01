@@ -18,22 +18,17 @@ from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
     PromptMessage,
     MultiModalPromptMessageContent,
+    ImagePromptMessageContent,
     PromptMessageContentType,
     PromptMessageTool,
     SystemPromptMessage,
     ToolPromptMessage,
     UserPromptMessage,
 )
-from dify_plugin.errors.model import (
-    CredentialsValidateFailedError,
-    InvokeAuthorizationError,
-    InvokeBadRequestError,
-    InvokeConnectionError,
-    InvokeError,
-    InvokeRateLimitError,
-    InvokeServerUnavailableError,
-)
+
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
+
+from ..common_gemini import _CommonGemini
 
 from .utils import FileCache
 
@@ -41,7 +36,7 @@ from .utils import FileCache
 file_cache = FileCache()
 
 
-class GoogleLargeLanguageModel(LargeLanguageModel):
+class GoogleLargeLanguageModel(_CommonGemini,LargeLanguageModel):
     def _invoke(
         self,
         model: str,
@@ -209,6 +204,9 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         config.temperature = model_parameters.get("temperature", None)
         config.max_output_tokens = model_parameters.get("max_output_tokens", None)
 
+        if "image" in model:
+            config.response_modalities = ["Text", "Image"]
+            
         config.tools = []
         if model_parameters.get("grounding"):
             config.tools.append(types.Tool(google_search=types.GoogleSearch()))
@@ -282,7 +280,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                     if c.type == PromptMessageContentType.TEXT:
                         glm_content.parts.append(types.Part.from_text(text=c.data))
                     else:
-                        f = self._upload_file_content_to_google(message_content=c)
+                        f = self._upload_file_content_to_google(message_content=c, credentials=message.credentials)
                         glm_content.parts.append(types.Part.from_uri(file_uri=f.uri, mime_type=f.mime_type))
 
             return glm_content
@@ -309,7 +307,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
             raise ValueError(f"Got unknown type {message}")
 
     def _upload_file_content_to_google(
-        self, message_content: MultiModalPromptMessageContent
+        self, message_content: MultiModalPromptMessageContent, credentials: dict
     ) -> types.File:
 
         key = f"{message_content.type.value}:{hash(message_content.data)}"
@@ -324,7 +322,10 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                 temp_file.write(file_content)
             else:
                 try:
-                    response = requests.get(message_content.url)
+                    file_url = message_content.url
+                    if credentials["local_files_url"]:
+                        file_url = f"{credentials["local_files_url"].rstrip('/')}/files{message_content.url.split("/files")[-1]}"
+                    response = requests.get(file_url)
                     response.raise_for_status()
                     temp_file.write(response.content)
                 except Exception as ex:
@@ -445,7 +446,16 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                                 ),
                             )
                         ]
-                
+                    elif part.inline_data:
+                        base64_str = base64.b64encode(part.inline_data.data).decode("utf-8")
+                        assistant_prompt_message.content = [
+                            ImagePromptMessageContent(
+                                base64_data=base64_str,
+                                format="." + part.inline_data.mime_type.split("/")[-1],
+                                mime_type=part.inline_data.mime_type,
+                            )
+                        ]
+                        
                 grounding_metadata = r.candidates[0].grounding_metadata
                 if grounding_metadata and grounding_metadata.search_entry_point:
                     assistant_prompt_message.content += grounding_metadata.search_entry_point.rendered_content
@@ -457,22 +467,3 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                     delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message)
                 )
 
-    @property
-    def _invoke_error_mapping(self) -> dict[type[InvokeError], list[type[Exception]]]:
-        """
-        Map model invoke error to unified error
-        """
-        return {
-            InvokeConnectionError: [errors.APIError],
-            InvokeServerUnavailableError: [
-                errors.ServerError,
-            ],
-            InvokeRateLimitError: [],
-            InvokeAuthorizationError: [],
-            InvokeBadRequestError: [
-                errors.ClientError,
-                errors.UnknownFunctionCallArgumentError,
-                errors.UnsupportedFunctionError,
-                errors.FunctionInvocationError,
-            ],
-        }

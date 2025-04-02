@@ -1,3 +1,4 @@
 dify_plugin~=0.0.1b76
 google-genai~=1.2.0
 google-generativeai~=0.8.4
+numpy~=2.2.4
